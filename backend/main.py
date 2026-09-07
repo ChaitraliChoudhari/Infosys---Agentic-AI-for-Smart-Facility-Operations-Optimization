@@ -9,6 +9,14 @@ from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# Add the project root (parent of backend/) to sys.path so cost_agent/,
+# which lives alongside occupancy_agent/ and maintenance_agent/, can be
+# imported regardless of which folder uvicorn is launched from.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cost_agent import cost_config
+
 
 app = FastAPI(
     title="Agentic FacilityOps AI Platform"
@@ -1507,3 +1515,435 @@ def security_dashboard():
         "High Alerts": int(severity_counts.get("HIGH", 0)),
         "Last Event": events["timestamp"].max().isoformat() if not events.empty else None
     }
+
+
+# ==========================================================
+# COST OPTIMIZATION AGENT — MILESTONE 4
+#
+# Reads from the already-loaded energy_df, maintenance_df,
+# occupancy_df, security_events_df, security_access_logs_df and
+# security_visitors_df — no new dataset/CSV is introduced. Cost
+# rates come from cost_agent/cost_config.py so they can be tuned
+# without touching this logic.
+# ==========================================================
+
+def compute_energy_cost():
+    df = load_energy_data()
+
+    total_kwh = float(df["EnergyConsumption"].sum())
+    total_cost = round(total_kwh * cost_config.RATE_PER_KWH, 2)
+    potential_savings = round(total_cost * cost_config.ENERGY_OPTIMIZATION_SAVINGS_PCT, 2)
+
+    return {
+        "category": "Energy",
+        "total_kwh": round(total_kwh, 2),
+        "rate_per_kwh": cost_config.RATE_PER_KWH,
+        "total_cost": total_cost,
+        "potential_savings": potential_savings
+    }
+
+
+def compute_maintenance_cost():
+    df = load_maintenance_data()
+
+    failures = int(df["failure"].sum())
+
+    # Use per-device average health, not per-reading — this dataset has
+    # ~124k readings across only ~1,169 devices, so counting raw rows
+    # would massively overstate how many devices actually need attention.
+    device_health = df.groupby("device")["Health Score"].mean()
+    critical_devices = int((device_health < 50).sum())
+    warning_devices = int(((device_health >= 50) & (device_health < 80)).sum())
+
+    failure_cost = failures * cost_config.MAINTENANCE_COST_PER_FAILURE
+    critical_cost = critical_devices * cost_config.MAINTENANCE_COST_PER_CRITICAL_INSPECTION
+    warning_cost = warning_devices * cost_config.MAINTENANCE_COST_PER_WARNING_INSPECTION
+
+    total_cost = round(failure_cost + critical_cost + warning_cost, 2)
+    potential_savings = round(total_cost * cost_config.MAINTENANCE_OPTIMIZATION_SAVINGS_PCT, 2)
+
+    return {
+        "category": "Maintenance",
+        "failures": failures,
+        "critical_devices": critical_devices,
+        "warning_devices": warning_devices,
+        "total_cost": total_cost,
+        "potential_savings": potential_savings
+    }
+
+
+def compute_security_cost():
+    load_security_data()
+
+    events = security_events_df
+    logs = security_access_logs_df
+    visitors = security_visitors_df
+
+    severity_counts = events["severity"].value_counts().to_dict()
+
+    event_cost = (
+        severity_counts.get("CRITICAL", 0) * cost_config.SECURITY_COST_PER_CRITICAL_EVENT
+        + severity_counts.get("HIGH", 0) * cost_config.SECURITY_COST_PER_HIGH_EVENT
+        + severity_counts.get("MEDIUM", 0) * cost_config.SECURITY_COST_PER_MEDIUM_EVENT
+        + severity_counts.get("LOW", 0) * cost_config.SECURITY_COST_PER_LOW_EVENT
+    )
+
+    denied_attempts = int((~logs["access_granted"]).sum())
+    denied_cost = denied_attempts * cost_config.SECURITY_COST_PER_DENIED_ACCESS
+
+    visitor_cost = len(visitors) * cost_config.SECURITY_COST_PER_VISITOR
+
+    total_cost = round(event_cost + denied_cost + visitor_cost, 2)
+    potential_savings = round(total_cost * cost_config.SECURITY_OPTIMIZATION_SAVINGS_PCT, 2)
+
+    return {
+        "category": "Security Operations",
+        "security_events": int(len(events)),
+        "denied_access_attempts": denied_attempts,
+        "total_visitors": int(len(visitors)),
+        "total_cost": total_cost,
+        "potential_savings": potential_savings
+    }
+
+
+def compute_admin_cost():
+    occupancy = load_occupancy_data()
+    total_zones = int(occupancy[["floor", "zone"]].drop_duplicates().shape[0])
+
+    total_cost = round(
+        total_zones * cost_config.ADMIN_COST_PER_ZONE_PER_DAY * cost_config.REPORTING_PERIOD_DAYS,
+        2
+    )
+    potential_savings = round(total_cost * cost_config.ADMIN_OPTIMIZATION_SAVINGS_PCT, 2)
+
+    return {
+        "category": "Administrative",
+        "total_zones": total_zones,
+        "reporting_period_days": cost_config.REPORTING_PERIOD_DAYS,
+        "total_cost": total_cost,
+        "potential_savings": potential_savings
+    }
+
+
+def compute_facility_health():
+    # Energy: penalize based on the share of high-consumption readings
+    energy_df_local = load_energy_data()
+    threshold = average_energy * 1.2
+    high_energy_share = float((energy_df_local["EnergyConsumption"] > threshold).mean())
+    energy_score = max(0.0, 100 - (high_energy_share * 100))
+
+    # Maintenance: already 0-100
+    maintenance_df_local = load_maintenance_data()
+    maintenance_score = float(maintenance_df_local["Health Score"].mean())
+
+    # Security: normalized 0-100 regardless of total event volume, so it
+    # doesn't just clip to 0 on facilities with a lot of logged events.
+    load_security_data()
+    severity_counts = security_events_df["severity"].value_counts().to_dict()
+    weights = cost_config.SECURITY_SEVERITY_WEIGHTS
+    total_events = int(len(security_events_df))
+
+    if total_events > 0:
+        weighted_bad = sum(severity_counts.get(sev, 0) * weight for sev, weight in weights.items())
+        worst_case = total_events * max(weights.values())
+        security_score = max(0.0, 100 * (1 - (weighted_bad / worst_case)))
+    else:
+        security_score = 100.0
+
+    # Occupancy: penalize deviation from an ideal utilization target
+    occupancy_df_local = load_occupancy_data()
+    latest_occupancy = latest_reading_per_zone(occupancy_df_local)
+    avg_occupancy_pct = float(latest_occupancy["occupancy_pct"].mean()) if not latest_occupancy.empty else 0.0
+    occupancy_score = max(0.0, 100 - abs(avg_occupancy_pct - cost_config.OCCUPANCY_HEALTH_TARGET_PCT))
+
+    facility_health = (
+        maintenance_score * cost_config.HEALTH_WEIGHT_MAINTENANCE
+        + energy_score * cost_config.HEALTH_WEIGHT_ENERGY
+        + security_score * cost_config.HEALTH_WEIGHT_SECURITY
+        + occupancy_score * cost_config.HEALTH_WEIGHT_OCCUPANCY
+    )
+
+    return {
+        "Facility Health Score": round(facility_health, 1),
+        "Components": {
+            "Maintenance": round(maintenance_score, 1),
+            "Energy": round(energy_score, 1),
+            "Security": round(security_score, 1),
+            "Occupancy": round(occupancy_score, 1)
+        }
+    }
+
+
+def build_optimizations_list(energy_cost, maintenance_cost, security_cost, admin_cost):
+    optimizations = []
+
+    if maintenance_cost["critical_devices"] > 0:
+        optimizations.append({
+            "Category": "Maintenance",
+            "Priority": "High",
+            "Recommendation": (
+                f'Schedule inspections for {maintenance_cost["critical_devices"]} device(s) '
+                f'in Critical health band before they fail.'
+            ),
+            "Potential Savings": round(
+                maintenance_cost["critical_devices"] * cost_config.MAINTENANCE_COST_PER_FAILURE
+                * cost_config.MAINTENANCE_OPTIMIZATION_SAVINGS_PCT, 2
+            )
+        })
+
+    if maintenance_cost["warning_devices"] > 0:
+        optimizations.append({
+            "Category": "Maintenance",
+            "Priority": "Medium",
+            "Recommendation": (
+                f'Plan preventive maintenance for {maintenance_cost["warning_devices"]} device(s) '
+                f'in Warning health band.'
+            ),
+            "Potential Savings": round(
+                maintenance_cost["warning_devices"] * cost_config.MAINTENANCE_COST_PER_WARNING_INSPECTION
+                * cost_config.MAINTENANCE_OPTIMIZATION_SAVINGS_PCT, 2
+            )
+        })
+
+    if energy_cost["total_cost"] > 0:
+        optimizations.append({
+            "Category": "Energy",
+            "Priority": "Medium",
+            "Recommendation": "Apply HVAC/lighting recommendations during low-occupancy, high-consumption hours.",
+            "Potential Savings": energy_cost["potential_savings"]
+        })
+
+    if security_cost["denied_access_attempts"] > 0:
+        optimizations.append({
+            "Category": "Security",
+            "Priority": "Medium",
+            "Recommendation": (
+                f'Review access policies — {security_cost["denied_access_attempts"]} denied attempt(s) '
+                f'logged, indicating possible badge/permission misconfiguration.'
+            ),
+            "Potential Savings": round(
+                security_cost["denied_access_attempts"] * cost_config.SECURITY_COST_PER_DENIED_ACCESS
+                * cost_config.SECURITY_OPTIMIZATION_SAVINGS_PCT, 2
+            )
+        })
+
+    if security_cost["security_events"] > 0:
+        optimizations.append({
+            "Category": "Security",
+            "Priority": "High",
+            "Recommendation": "Prioritize proactive CCTV monitoring in zones generating repeated HIGH/CRITICAL events.",
+            "Potential Savings": security_cost["potential_savings"]
+        })
+
+    optimizations.append({
+        "Category": "Administrative",
+        "Priority": "Low",
+        "Recommendation": "Automate cross-agent reporting to reduce manual facility admin overhead.",
+        "Potential Savings": admin_cost["potential_savings"]
+    })
+
+    return optimizations
+
+
+@app.get("/cost/breakdown")
+def cost_breakdown():
+    energy_cost = compute_energy_cost()
+    maintenance_cost = compute_maintenance_cost()
+    security_cost = compute_security_cost()
+    admin_cost = compute_admin_cost()
+
+    categories = [energy_cost, maintenance_cost, security_cost, admin_cost]
+    total_cost = sum(category["total_cost"] for category in categories)
+
+    for category in categories:
+        category["pct_of_total"] = (
+            round((category["total_cost"] / total_cost) * 100, 1) if total_cost > 0 else 0.0
+        )
+
+    return {
+        "Total Cost": round(total_cost, 2),
+        "Categories": categories
+    }
+
+
+@app.get("/cost/optimizations")
+def cost_optimizations():
+    energy_cost = compute_energy_cost()
+    maintenance_cost = compute_maintenance_cost()
+    security_cost = compute_security_cost()
+    admin_cost = compute_admin_cost()
+
+    optimizations = build_optimizations_list(energy_cost, maintenance_cost, security_cost, admin_cost)
+    optimizations.sort(key=lambda item: {"High": 0, "Medium": 1, "Low": 2}.get(item["Priority"], 3))
+
+    return optimizations
+
+
+@app.get("/cost/facility-health")
+def cost_facility_health():
+    return compute_facility_health()
+
+
+@app.get("/cost/dashboard")
+def cost_dashboard():
+    energy_cost = compute_energy_cost()
+    maintenance_cost = compute_maintenance_cost()
+    security_cost = compute_security_cost()
+    admin_cost = compute_admin_cost()
+
+    total_cost = round(
+        energy_cost["total_cost"] + maintenance_cost["total_cost"]
+        + security_cost["total_cost"] + admin_cost["total_cost"], 2
+    )
+    total_potential_savings = round(
+        energy_cost["potential_savings"] + maintenance_cost["potential_savings"]
+        + security_cost["potential_savings"] + admin_cost["potential_savings"], 2
+    )
+
+    cost_reduction_pct = round((total_potential_savings / total_cost) * 100, 1) if total_cost > 0 else 0.0
+
+    optimizations = build_optimizations_list(energy_cost, maintenance_cost, security_cost, admin_cost)
+    facility_health = compute_facility_health()
+
+    return {
+        "Cost Reduction %": cost_reduction_pct,
+        "ROI Generated": total_potential_savings,
+        "Facility Health": facility_health["Facility Health Score"],
+        "Optimizations": len(optimizations),
+        "Total Cost": total_cost,
+        "Total Potential Savings": total_potential_savings
+    }
+
+
+@app.get("/cost/report")
+def facility_intelligence_report():
+    """
+    Cross-agent orchestration: combines Energy, Maintenance, Occupancy,
+    Security and Cost dashboards into a single Facility Intelligence Report.
+    """
+    return {
+        "Generated At": datetime.now().isoformat(),
+        "Cost Summary": cost_dashboard(),
+        "Cost Breakdown": cost_breakdown(),
+        "Optimizations": cost_optimizations(),
+        "Facility Health": compute_facility_health(),
+        "Energy": dashboard(),
+        "Maintenance": maintenance_dashboard(),
+        "Occupancy": occupancy_dashboard(),
+        "Security": security_dashboard()
+    }
+
+
+# ==========================================================
+# ROI / PAYBACK SIMULATOR — MILESTONE 4 ENHANCEMENT
+#
+# Pure calculator: given a subsystem's current monthly cost, a target
+# AI-driven efficiency gain %, and a one-time implementation cost, it
+# returns projected annual savings and payback period. Independent of
+# the dataset-derived cost_breakdown() above — this is for "what if I
+# invest in X" scenario planning, not the actual measured spend.
+# ==========================================================
+
+@app.post("/cost/roi-simulator")
+def roi_simulator(payload: dict = Body(...)):
+    try:
+        monthly_cost = float(payload.get("subsystem_monthly_cost"))
+        efficiency_gain_pct = float(payload.get("target_efficiency_gain_pct"))
+        implementation_cost = float(payload.get("one_time_implementation_cost", 0))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "subsystem_monthly_cost and target_efficiency_gain_pct are required numeric fields"}
+        )
+
+    if monthly_cost < 0 or not (0 <= efficiency_gain_pct <= 100):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "subsystem_monthly_cost must be >= 0 and target_efficiency_gain_pct must be 0-100"}
+        )
+
+    monthly_savings = monthly_cost * (efficiency_gain_pct / 100)
+    annual_savings = round(monthly_savings * 12, 2)
+
+    if monthly_savings > 0:
+        payback_months = round(implementation_cost / monthly_savings, 1)
+    else:
+        payback_months = None
+
+    roi_pct = (
+        round(((annual_savings - implementation_cost) / implementation_cost) * 100, 1)
+        if implementation_cost > 0 else None
+    )
+
+    return {
+        "Monthly Savings": round(monthly_savings, 2),
+        "Annual Recurring Savings": annual_savings,
+        "Payback Period (Months)": payback_months,
+        "Expected ROI %": roi_pct
+    }
+
+
+# ==========================================================
+# BUDGET VARIANCE — MILESTONE 4 ENHANCEMENT
+#
+# Compares the dataset-derived actual monthly cost (cost_breakdown)
+# against an approved baseline budget target configured in
+# cost_agent/cost_config.py.
+# ==========================================================
+
+@app.get("/cost/budget-variance")
+def budget_variance():
+    breakdown = cost_breakdown()
+
+    actual_cost = breakdown["Total Cost"]
+    baseline = cost_config.BASELINE_MONTHLY_BUDGET
+    variance = round(actual_cost - baseline, 2)
+    variance_pct = round((variance / baseline) * 100, 1) if baseline > 0 else 0.0
+
+    return {
+        "Total Monthly OpEx": actual_cost,
+        "Baseline Budget Target": baseline,
+        "Budget Variance": variance,
+        "Budget Variance %": variance_pct,
+        "Over Budget": variance > 0
+    }
+
+
+# ==========================================================
+# CROSS-AGENT ORCHESTRATION CENTER — MILESTONE 4 ENHANCEMENT
+#
+# Presents the same optimizations already computed by
+# build_optimizations_list() as a log of "orchestration actions",
+# labeling low-cost-impact items as auto-EXECUTED and higher-impact
+# items as DETECTED (pending manual approval). No new data source —
+# this is a different view of the existing optimization output.
+# ==========================================================
+
+@app.get("/cost/orchestration-log")
+def orchestration_log():
+    energy_cost = compute_energy_cost()
+    maintenance_cost = compute_maintenance_cost()
+    security_cost = compute_security_cost()
+    admin_cost = compute_admin_cost()
+
+    optimizations = build_optimizations_list(energy_cost, maintenance_cost, security_cost, admin_cost)
+    threshold = cost_config.ORCHESTRATION_AUTO_EXECUTE_THRESHOLD
+    agents_by_category = cost_config.ORCHESTRATION_AGENTS_BY_CATEGORY
+
+    actions = []
+
+    for index, optimization in enumerate(optimizations, start=1):
+        savings = optimization["Potential Savings"]
+        status = "EXECUTED" if savings < threshold else "DETECTED"
+
+        actions.append({
+            "Action ID": f'ORCH-{optimization["Category"][:4].upper()}-{index:03d}',
+            "Category": optimization["Category"],
+            "Agents Involved": agents_by_category.get(optimization["Category"], ["Cost Agent"]),
+            "Recommendation": optimization["Recommendation"],
+            "Cost Impact": savings,
+            "Priority": optimization["Priority"],
+            "Status": status
+        })
+
+    return actions
