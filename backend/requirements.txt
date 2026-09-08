@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 streamlit
-pandas
+pandas<3
 plotly
 matplotlib
 numpy
