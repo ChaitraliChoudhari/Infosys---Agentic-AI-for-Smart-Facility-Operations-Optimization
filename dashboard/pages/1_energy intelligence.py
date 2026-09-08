@@ -203,9 +203,17 @@ def render_energy_live_data(average_energy):
                 )
             with ec5:
                 energy_record_id = energy_row.get("id", None)
-
-                if energy_record_id is not None and st.button(
-                    "Delete", key=f"delete_energy_{energy_record_id}"
+ 
+                # Guard against NaN ids (e.g. a stray simulated/preview
+                # row with no real backend id) so we never crash on
+                # int(NaN) — we simply skip rendering a Delete button
+                # for that row instead.
+                valid_id = energy_record_id is not None and not (
+                    isinstance(energy_record_id, float) and pd.isna(energy_record_id)
+                )
+ 
+                if valid_id and st.button(
+                    "Delete", key=f"delete_energy_{int(energy_record_id)}"
                 ):
                     if delete_api(f"/energy-records/{int(energy_record_id)}"):
                         st.success("Record deleted.")
@@ -231,27 +239,33 @@ simulation = get_api(
         "weekend": record_weekend
     }
 )
-
+ 
 if simulation is None:
     st.stop()
-
+ 
 simulated_df = pd.DataFrame([simulation])
-
-df["Simulated"] = "Historical"
-df = pd.concat([df, simulated_df], ignore_index=True)
-df["Simulated"] = df["Simulated"].fillna("Simulated")
-
-df["EnergyConsumption"] = pd.to_numeric(df["EnergyConsumption"], errors="coerce")
-df["Temperature"] = pd.to_numeric(df["Temperature"], errors="coerce")
-df["Occupancy"] = pd.to_numeric(df["Occupancy"], errors="coerce")
-df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-
-df = df.dropna(subset=["EnergyConsumption"])
-
-average_energy = df["EnergyConsumption"].mean()
-maximum_energy = df["EnergyConsumption"].max()
-minimum_energy = df["EnergyConsumption"].min()
-high_alert_count = int((df["EnergyConsumption"] > average_energy * 1.2).sum())
+ 
+# NOTE: everything from here on uses `plot_df`, a separate variable
+# from `df`. Do NOT reassign `df` itself — the render_energy_live_data
+# fragment above closes over the module-level `df`, and on a
+# fragment-only rerun (e.g. clicking Delete) this section does not
+# re-execute, so `df` must stay exactly what came back from /energy.
+plot_df = df.copy()
+plot_df["Simulated"] = "Historical"
+plot_df = pd.concat([plot_df, simulated_df], ignore_index=True)
+plot_df["Simulated"] = plot_df["Simulated"].fillna("Simulated")
+ 
+plot_df["EnergyConsumption"] = pd.to_numeric(plot_df["EnergyConsumption"], errors="coerce")
+plot_df["Temperature"] = pd.to_numeric(plot_df["Temperature"], errors="coerce")
+plot_df["Occupancy"] = pd.to_numeric(plot_df["Occupancy"], errors="coerce")
+plot_df["Timestamp"] = pd.to_datetime(plot_df["Timestamp"], errors="coerce")
+ 
+plot_df = plot_df.dropna(subset=["EnergyConsumption"])
+ 
+average_energy = plot_df["EnergyConsumption"].mean()
+maximum_energy = plot_df["EnergyConsumption"].max()
+minimum_energy = plot_df["EnergyConsumption"].min()
+high_alert_count = int((plot_df["EnergyConsumption"] > average_energy * 1.2).sum())
 
 # ==================================================
 # CONSUMPTION TREND AREA CHART
