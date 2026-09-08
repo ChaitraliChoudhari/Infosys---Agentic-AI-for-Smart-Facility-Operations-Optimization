@@ -6,7 +6,10 @@ import plotly.graph_objects as go
 # CONFIGURATION
 # ==========================================================
 
-BACKEND_URL = "http://127.0.0.1:8000"
+try:
+    BACKEND_URL = st.secrets["BACKEND_URL"]
+except (KeyError, FileNotFoundError):
+    BACKEND_URL = "http://127.0.0.1:8000"
 
 CACHE_TTL_SECONDS = 5
 
