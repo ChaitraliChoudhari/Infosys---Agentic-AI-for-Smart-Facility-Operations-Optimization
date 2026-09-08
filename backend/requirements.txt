@@ -6,3 +6,5 @@ plotly
 matplotlib
 numpy
 requests
+scikit-learn
+joblib
