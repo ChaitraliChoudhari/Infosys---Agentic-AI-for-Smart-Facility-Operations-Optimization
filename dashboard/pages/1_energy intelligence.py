@@ -336,7 +336,7 @@ st.plotly_chart(fig_trend, use_container_width=True)
 section_title("Temperature vs Energy")
 
 temperature_columns = ["Temperature", "EnergyConsumption", "Simulated"]
-temperature_df = df.dropna(subset=[c for c in temperature_columns if c in df.columns])
+temperature_df = plot_df.dropna(subset=[c for c in temperature_columns if c in plot_df.columns])
 
 if not temperature_df.empty:
     temperature_hover = [c for c in ["Timestamp", "Occupancy", "Hour", "Weekend"] if c in temperature_df.columns]
@@ -369,7 +369,7 @@ else:
 section_title("Occupancy vs Energy")
 
 occupancy_columns = ["Occupancy", "EnergyConsumption", "Simulated"]
-occupancy_df = df.dropna(subset=[c for c in occupancy_columns if c in df.columns])
+occupancy_df = plot_df.dropna(subset=[c for c in occupancy_columns if c in plot_df.columns])
 
 if not occupancy_df.empty:
     occupancy_hover = [c for c in ["Timestamp", "Temperature", "Hour", "Weekend"] if c in occupancy_df.columns]
