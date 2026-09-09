@@ -531,6 +531,7 @@ def startup_load():
 # ==========================================================
 
 @app.get("/")
+@app.head("/")
 def home():
     return {"message": "Welcome to Agentic FacilityOps AI Platform"}
 
