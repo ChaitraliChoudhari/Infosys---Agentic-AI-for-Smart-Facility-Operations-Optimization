@@ -143,8 +143,10 @@ def render_maintenance_live_data(full_records_df, all_metric_names):
     top of the page instead of re-fetching and re-parsing the full
     ~100k+ row maintenance table a second time just to show the last
     10 records. Only a POST/DELETE inside this fragment needs a fresh
-    read, and those already call clear_api_cache() so the next full
-    page rerun (st.rerun()) picks up the change.
+    read — those call clear_api_cache() AND st.rerun() so the resulting
+    full page rerun re-fetches records_df with the change applied
+    (a bare fragment rerun would keep using the stale full_records_df
+    argument this function was called with).
     """
     SCORING_METRICS = ["metric3", "metric4", "metric5", "metric6", "metric9"]
     local_metric_names = [n for n in all_metric_names if n in SCORING_METRICS]
@@ -173,10 +175,12 @@ def render_maintenance_live_data(full_records_df, all_metric_names):
 
         if result is not None:
             st.session_state["_maint_flash"] = ("success", "Record added successfully.")
+            st.rerun()
 
     def handle_delete_maintenance_record(record_id):
         if delete_api(f"/maintenance-records/{record_id}"):
             st.session_state["_maint_flash"] = ("success", "Record deleted.")
+            st.rerun()
 
     section_title("Add / Remove Live Data")
 
