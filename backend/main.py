@@ -366,6 +366,34 @@ def persist_maintenance_df(df):
     return df
 
 
+def device_level_health_df():
+    """
+    Collapse the ~124k raw readings down to one row per device (~1,169
+    devices), using the mean Health Score per device and whether that
+    device has EVER logged a failure. This mirrors the aggregation
+    already used in compute_maintenance_cost() below and is what fixed
+    the OOM crashes: /health-score, /maintenance-schedule,
+    /maintenance-alerts and /maintenance-report used to serialize every
+    raw reading (huge JSON payload built fresh on every request), which
+    on a 512MB instance eventually gets OOM-killed by Render. Aggregating
+    first cuts the response size by roughly 100x.
+    """
+    df = load_maintenance_data()
+
+    grouped = (
+        df.groupby("device", as_index=False)
+        .agg(**{
+            "Health Score": ("Health Score", "mean"),
+            "failure": ("failure", "max")
+        })
+    )
+
+    grouped["Health Score"] = grouped["Health Score"].round(2)
+    grouped["Status"] = status_series(grouped["Health Score"])
+
+    return grouped
+
+
 # ==========================================================
 # DATA LOADING
 # ==========================================================
@@ -732,49 +760,60 @@ def delete_energy_record(record_id: int):
 
 # ==========================================================
 # PREDICTIVE MAINTENANCE
+#
+# NOTE ON THE FIX: the raw dataset has ~124k readings across only
+# ~1,169 devices. /health-score, /maintenance-schedule,
+# /maintenance-alerts and /maintenance-report now use
+# device_level_health_df() (one row per device) instead of serializing
+# every raw reading on every request — this is what was causing the
+# backend to run out of memory (512MB free-tier limit) and crash,
+# producing 502s on the Streamlit maintenance page. /maintenance-records
+# now defaults to a capped, most-recent-first limit instead of returning
+# the entire table when no `limit` query param is supplied.
 # ==========================================================
 
 @app.get("/health-score")
 def health_score():
-    df = load_maintenance_data().copy()
-    df["Status"] = status_series(df["Health Score"])
+    grouped = device_level_health_df()
 
-    output = df[["device", "Health Score", "Status"]].rename(columns={"device": "Device"})
+    output = grouped[["device", "Health Score", "Status"]].rename(columns={"device": "Device"})
+    output = output.sort_values("Health Score")
 
     return output.to_dict(orient="records")
 
 
 @app.get("/maintenance-schedule")
 def maintenance_schedule():
-    df = load_maintenance_data().copy()
+    grouped = device_level_health_df()
     today = datetime.today()
 
     days_offset = np.select(
-        [df["Health Score"] < 50, df["Health Score"] < 80], [3, 7], default=30
+        [grouped["Health Score"] < 50, grouped["Health Score"] < 80], [3, 7], default=30
     )
     priority = np.select(
-        [df["Health Score"] < 50, df["Health Score"] < 80], ["High", "Medium"], default="Low"
+        [grouped["Health Score"] < 50, grouped["Health Score"] < 80], ["High", "Medium"], default="Low"
     )
 
-    df["Maintenance Date"] = (today + pd.to_timedelta(days_offset, unit="D")).strftime("%Y-%m-%d")
-    df["Priority"] = priority
+    grouped["Maintenance Date"] = (today + pd.to_timedelta(days_offset, unit="D")).strftime("%Y-%m-%d")
+    grouped["Priority"] = priority
 
-    output = df[["device", "Health Score", "Maintenance Date", "Priority"]].rename(columns={"device": "Device"})
+    output = grouped[["device", "Health Score", "Maintenance Date", "Priority"]].rename(columns={"device": "Device"})
+    output = output.sort_values("Health Score")
 
     return output.to_dict(orient="records")
 
 
 @app.get("/maintenance-alerts")
 def maintenance_alerts():
-    df = load_maintenance_data().copy()
+    grouped = device_level_health_df()
 
-    df["Alert"] = np.select(
-        [df["Health Score"] < 50, df["Health Score"] < 80],
+    grouped["Alert"] = np.select(
+        [grouped["Health Score"] < 50, grouped["Health Score"] < 80],
         ["Immediate maintenance required", "Inspection recommended"],
         default=None
     )
 
-    flagged = df[df["Alert"].notna()]
+    flagged = grouped[grouped["Alert"].notna()]
     output = flagged[["device", "Alert"]].rename(columns={"device": "Device"})
 
     return output.to_dict(orient="records")
@@ -782,11 +821,12 @@ def maintenance_alerts():
 
 @app.get("/maintenance-report")
 def maintenance_report():
-    df = load_maintenance_data().copy()
-    df["Status"] = status_series(df["Health Score"])
-    df["Failure"] = df["failure"].astype(int)
+    grouped = device_level_health_df()
 
-    output = df[["device", "Health Score", "Status", "Failure"]].rename(columns={"device": "Device"})
+    output = grouped[["device", "Health Score", "Status", "failure"]].rename(
+        columns={"device": "Device", "failure": "Failure"}
+    )
+    output["Failure"] = output["Failure"].astype(int)
 
     return output.to_dict(orient="records")
 
@@ -846,11 +886,9 @@ def device_health_summary():
 
 
 @app.get("/maintenance-records")
-def get_maintenance_records(limit: int = Query(None, ge=1)):
+def get_maintenance_records(limit: int = Query(500, ge=1, le=5000)):
     df = load_maintenance_data()
-
-    if limit is not None:
-        df = df.sort_values("id").tail(limit)
+    df = df.sort_values("id").tail(limit)
 
     return safe_records(df)
 
